@@ -75,7 +75,12 @@ struct VertexOutput
     //UNITY_VERTEX_INPUT_INSTANCE_ID
 };
 
-uint3 computeClusterIndex(uint3 clusterIndex3D)
+struct VertexOutputDepthOnly
+{
+    float4 clipPos : SV_POSITION;
+};
+
+uint computeClusterIndex(uint3 clusterIndex3D)
 {
     return clusterIndex3D.x + (cb_clusterCount.x * (clusterIndex3D.y + cb_clusterCount.y * clusterIndex3D.z));
 }
@@ -107,6 +112,18 @@ VertexOutput LitPassVertex(VertexInput input)
     output.normal = mul(UNITY_MATRIX_M, float4(input.normal, 0.0)).xyz;
     output.uv = input.uv;
     return output;
+}
+
+VertexOutputDepthOnly DepthOnlyVertex(VertexInput input)
+{
+    VertexOutputDepthOnly output;
+    output.clipPos = mul(unity_MatrixVP, float4(input.pos, 1.0));
+    return output;
+}
+
+float4 DepthOnlyFrag(VertexOutputDepthOnly input) : SV_Target
+{
+    return float4(0,0,0,0);
 }
 
 float4 LitPassFrag(VertexOutput input) : SV_Target

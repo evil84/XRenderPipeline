@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Numerics;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using Matrix4x4 = UnityEngine.Matrix4x4;
+using RenderPipeline = UnityEngine.Rendering.RenderPipeline;
 using Vector2 = UnityEngine.Vector2;
 using Vector3 = UnityEngine.Vector3;
 using Vector4 = UnityEngine.Vector4;
@@ -40,11 +42,13 @@ public class MyRenderPipeline : RenderPipeline
 	private int _clusterXYZCount = 0;
 	private ComputeShader _clusterRenderingCS;
 	private ComputeShader _clusterLightCullingCS;
+	private ComputeShader _debugLightingCS;
 	private ComputeBuffer _clusterBuffer;
 	private ComputeBuffer _LightBuffer;
 
 	private int _clusterComputeKernel;
 	private int _lightCullingKernel;
+	private int _debugLightingKernel;
 	private int _lightCount;
 	private int _ClusterXCount;
 	private int _ClusterYCount;
@@ -54,6 +58,12 @@ public class MyRenderPipeline : RenderPipeline
 	private ComputeBuffer g_lightGrid;
 
 	private XPipelineAsset _pipelineAsset;
+
+	
+	private int depthTargetTextureId;
+	private int colorTargetTextureId;
+
+	private RenderTexture _debugTexture;
 	
 	public MyRenderPipeline(XPipelineAsset asset)
 	{
@@ -61,8 +71,12 @@ public class MyRenderPipeline : RenderPipeline
 		//_clusterRenderingCS = _pipelineAsset.clusterRenderingCS;
 		_clusterRenderingCS = Resources.Load<ComputeShader>("ClusterRendering");
 		_clusterLightCullingCS = Resources.Load<ComputeShader>("ClusterLightCulling");
+		_debugLightingCS = Resources.Load<ComputeShader>("DebugLighting");
 		_clusterComputeKernel = _clusterRenderingCS.FindKernel("ClusterCompute");
 		_lightCullingKernel = _clusterLightCullingCS.FindKernel("ClusterLightCulling");
+		_debugLightingKernel = _debugLightingCS.FindKernel("DebugLightting");
+		depthTargetTextureId = Shader.PropertyToID("depthTexture");
+		colorTargetTextureId = Shader.PropertyToID("sceneTexture");
 	}
 	
     protected override void Render(ScriptableRenderContext context, Camera[] cameras)
@@ -79,44 +93,46 @@ public class MyRenderPipeline : RenderPipeline
 	    ScriptableCullingParameters cullingParameters;
 	    if (!camera.TryGetCullingParameters(false, out cullingParameters))
 		    return;
-		
-
+	    
 	    GraphicsSettings.lightsUseLinearIntensity = true;
 
 	    _cameraBuffer = CommandBufferPool.Get(camera.name);
 	    
 	    context.SetupCameraProperties(camera);
+		
+	    
+	    RenderTextureDescriptor descriptor = CreateRenderTextureDescriptor(camera, 1);
+	    var depthDescriptor = descriptor;
+	    depthDescriptor.colorFormat = RenderTextureFormat.Depth;
+	    depthDescriptor.depthBufferBits = 32;
+	    depthDescriptor.bindMS = false;
+	    _cameraBuffer.GetTemporaryRT(depthTargetTextureId, depthDescriptor, FilterMode.Point);
+
+	    var colorDescriptor = descriptor;
+	    descriptor.colorFormat = RenderTextureFormat.ARGB32;
+	    descriptor.bindMS = false;
+	    _cameraBuffer.GetTemporaryRT(colorTargetTextureId, colorDescriptor, FilterMode.Bilinear);
+	    _cameraBuffer.SetRenderTarget(new RenderTargetIdentifier(colorTargetTextureId), new RenderTargetIdentifier(depthTargetTextureId));
+	    
 	    CameraClearFlags clearFlags = camera.clearFlags;
 	    _cameraBuffer.ClearRenderTarget((clearFlags & CameraClearFlags.Depth) != 0, (clearFlags & CameraClearFlags.Color) != 0, camera.backgroundColor, 1.0f);
-	    
+	    context.ExecuteCommandBuffer(_cameraBuffer);
+	    _cameraBuffer.Clear();
+
 #if UNITY_EDITOR
 	    ScriptableRenderContext.EmitWorldGeometryForSceneView(camera);
 #endif
 	    
 		var cullingResult = context.Cull(ref cullingParameters);
 		
-		
 		SetupCameraClusters(camera);
 		UpdateLightBuffer(cullingResult);
 		LightCulling(camera);
-			//context.ExecuteCommandBuffer(cameraBuffer);
-			//cameraBuffer.Clear();
+		context.ExecuteCommandBuffer(_cameraBuffer);
+		_cameraBuffer.Clear();
+		//DrawDepthOnlyPass(camera, context, cullingResult);
 		
-		//SetupLights(cullingResult);
-	    
-	    //cameraBuffer.BeginSample("Render Camera");
-	    if (camera.cameraType == CameraType.SceneView)
-	    {
-		    
-		    //debugClusterRendering();
-		    //context.ExecuteCommandBuffer(cameraBuffer);
-		    //cameraBuffer.Clear();
-		    
-	    }
-	    
-	    //cameraBuffer.SetGlobalVectorArray(shaderVisibleLightColorsId, visibleLightColors);
-	    //cameraBuffer.SetGlobalVectorArray(shaderVisibleLightDirectionsId, visibleLightDirections);
-	    _ClusterXCount = Mathf.CeilToInt((float) Screen.width / clusterWidth);
+		_ClusterXCount = Mathf.CeilToInt((float) Screen.width / clusterWidth);
 	    _ClusterYCount = Mathf.CeilToInt((float) Screen.height / clusterHeight);
 	    
 	    _cameraBuffer.SetGlobalBuffer("g_lights", _LightBuffer);
@@ -143,7 +159,6 @@ public class MyRenderPipeline : RenderPipeline
 	    var filterSettings = new FilteringSettings(RenderQueueRange.opaque);
 	    context.DrawRenderers(cullingResult, ref drawSettings, ref filterSettings);
 	    
-	    
 	    context.DrawSkybox(camera);
 	    filterSettings.renderQueueRange = RenderQueueRange.transparent;
 	    context.DrawRenderers(cullingResult, ref drawSettings, ref filterSettings);
@@ -152,7 +167,15 @@ public class MyRenderPipeline : RenderPipeline
 	    {
 		    context.DrawGizmos(camera, GizmoSubset.PostImageEffects);
 	    }
-
+	    
+	    //DebugLighting(camera);
+	    context.ExecuteCommandBuffer(_cameraBuffer);
+	    _cameraBuffer.Clear();
+	    
+	    //_cameraBuffer.Blit(_debugTexture, BuiltinRenderTextureType.CameraTarget);
+	    _cameraBuffer.Blit(new RenderTargetIdentifier(colorTargetTextureId), BuiltinRenderTextureType.CameraTarget);
+	    context.ExecuteCommandBuffer(_cameraBuffer);
+	    _cameraBuffer.Clear();
 	    context.Submit();
 	    
     }
@@ -248,8 +271,98 @@ public class MyRenderPipeline : RenderPipeline
 	    _cameraBuffer.SetComputeIntParams(_clusterRenderingCS, "clusterCount", new int[]{ _ClusterXCount, _ClusterYCount, clusterZCount });
 	    _cameraBuffer.DispatchCompute(_clusterLightCullingCS, _lightCullingKernel, _clusterXYZCount, 1, 1);
     }
+
+    private void DrawDepthOnlyPass(Camera camera, ScriptableRenderContext context, CullingResults cullingResult)
+    {
+	    FilteringSettings filteringSettings = new FilteringSettings(RenderQueueRange.opaque);
+	    filteringSettings.layerMask = camera.cullingMask;
+	    var drawSettings = new DrawingSettings(new ShaderTagId("DepthOnly"), new SortingSettings(camera)
+	    {
+		    criteria = SortingCriteria.QuantizedFrontToBack,
+	    });
+	    
+	    drawSettings.perObjectData = PerObjectData.None;
+	    context.DrawRenderers(cullingResult, ref drawSettings, ref filteringSettings);
+    }
+
+    private void DebugLighting(Camera camera)
+    {
+	    if (_debugTexture == null)
+	    {
+		    _debugTexture = new RenderTexture(Screen.width, Screen.height, 0, RenderTextureFormat.ARGBFloat);
+		    _debugTexture.enableRandomWrite = true;
+		    _debugTexture.Create();
+	    }
+	    
+	    int clusterXCount = Mathf.CeilToInt((float) Screen.width / clusterWidth);
+	    int clusterYCount = Mathf.CeilToInt((float) Screen.height / clusterHeight);
+	    
+	    _cameraBuffer.SetComputeTextureParam(_debugLightingCS, _debugLightingKernel, "debugTexture", _debugTexture);
+	    _cameraBuffer.SetComputeTextureParam(_debugLightingCS, _debugLightingKernel, "depthTexture", new RenderTargetIdentifier(depthTargetTextureId));
+	    _cameraBuffer.SetComputeTextureParam(_debugLightingCS, _debugLightingKernel, "sceneTexture", new RenderTargetIdentifier(colorTargetTextureId));
+	    _cameraBuffer.SetComputeBufferParam(_debugLightingCS, _debugLightingKernel, "lightGridBuffer", g_lightGrid);
+	    _cameraBuffer.SetComputeFloatParams(_debugLightingCS, "screenSize", new float[] { Screen.width, Screen.height, 1.0f / Screen.width, 1.0f / Screen.height });
+	    _cameraBuffer.SetComputeIntParams(_clusterRenderingCS, "clusterCount", new int[]{ clusterXCount, clusterYCount, clusterZCount });
+	    Matrix4x4 projectionMatrix;
+	    if (camera.cameraType == CameraType.SceneView)
+		    projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+	    else
+		    projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, false);
+		
+	    var projectionMatrixInverse = projectionMatrix.inverse;
+	    _cameraBuffer.SetComputeMatrixParam(_debugLightingCS, "inverseProjectionMatrix", projectionMatrixInverse);
+	    _cameraBuffer.DispatchCompute(_debugLightingCS, _debugLightingKernel, Mathf.CeilToInt((float)Screen.width / 32), Mathf.CeilToInt((float)Screen.height / 32), 1);
+    }
     
     
+    private RenderTextureDescriptor CreateRenderTextureDescriptor(Camera camera, int msaaSamples)
+    {
+	    RenderTextureDescriptor desc;
+	    RenderTextureFormat renderTextureFormatDefault = RenderTextureFormat.Default;
+	    
+	    desc = new RenderTextureDescriptor(camera.pixelWidth, camera.pixelHeight);
+	    desc.width = (int)((float)desc.width);
+	    desc.height = (int)((float)desc.height);
+	    
+
+	    // TODO: when preserve framebuffer alpha is enabled we can't use RGB111110Float format.
+	    bool useRGB111110 = Application.isMobilePlatform &&
+	                        SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.RGB111110Float);
+	    RenderTextureFormat hdrFormat = (useRGB111110) ? RenderTextureFormat.RGB111110Float : RenderTextureFormat.DefaultHDR;
+	    desc.colorFormat = renderTextureFormatDefault;
+	    desc.depthBufferBits = 32;
+	    desc.enableRandomWrite = false;
+	    desc.sRGB = (QualitySettings.activeColorSpace == ColorSpace.Linear);
+	    desc.msaaSamples = msaaSamples;
+	    desc.bindMS = false;
+	    desc.useDynamicScale = camera.allowDynamicResolution;
+	    return desc;
+    }
+    
+    static RenderTextureDescriptor CreateRenderTextureDescriptor(Camera camera, bool isHdrEnabled, int msaaSamples)
+    {
+	    RenderTextureDescriptor desc;
+	    RenderTextureFormat renderTextureFormatDefault = RenderTextureFormat.Default;
+	    
+	    desc = new RenderTextureDescriptor(camera.pixelWidth, camera.pixelHeight);
+	    desc.width = (int)((float)desc.width);
+	    desc.height = (int)((float)desc.height);
+    
+
+	    // TODO: when preserve framebuffer alpha is enabled we can't use RGB111110Float format.
+	    bool useRGB111110 = Application.isMobilePlatform &&
+	                        SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.RGB111110Float);
+	    RenderTextureFormat hdrFormat = (useRGB111110) ? RenderTextureFormat.RGB111110Float : RenderTextureFormat.DefaultHDR;
+	    desc.colorFormat = isHdrEnabled ? hdrFormat : renderTextureFormatDefault;
+	    desc.depthBufferBits = 32;
+	    desc.enableRandomWrite = false;
+	    desc.sRGB = (QualitySettings.activeColorSpace == ColorSpace.Linear);
+	    desc.msaaSamples = msaaSamples;
+	    desc.bindMS = false;
+	    desc.useDynamicScale = camera.allowDynamicResolution;
+	    return desc;
+    }
+
     private void debugClusterRendering()
     {
 	    Material debugMat = Resources.Load<Material>("debugClusterMat");
