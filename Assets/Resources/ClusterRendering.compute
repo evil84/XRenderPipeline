@@ -1,0 +1,118 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ClusterCompute
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+struct Plane
+{
+    float3 n;
+    float d;
+};
+
+struct Frustum
+{
+    Plane planes[4];
+    float2 nearFar;  
+};
+
+struct CSInput
+{
+    uint3 groupId : SV_GroupID;
+    uint3 dispatchThreadId : SV_DispatchThreadID;
+    uint3 groupdThradId : SV_GroupThreadID;
+    uint  groupIndex : SV_GroupIndex;
+};
+
+RWStructuredBuffer<Frustum> g_clusters;
+
+//CBUFFER_START(_ClusterBuffer)
+    uint3       clusterCount;
+    uint2       clusterSize;
+    float2      nearFarPlane;
+    float4      screenSize;
+    float4x4    inverseProjectionMatrix;
+//CBUFFER_END
+
+Plane ComputePlane(float3 p0, float3 p1, float3 p2)
+{
+    Plane plane;
+    float3 v0 = p1 - p0;
+    float3 v1 = p2 - p0;
+    plane.n = normalize(cross(v0, v1));
+    plane.d = dot(plane.n, p0);
+    return plane;
+}
+
+uint3 ComputeClusterIndex3d(uint index)
+{
+    uint x = index % clusterCount.x;
+    uint y = index % (clusterCount.x * clusterCount.y) / clusterCount.x;
+    uint z = index / (clusterCount.x * clusterCount.y);
+    return uint3(x, y, z);
+}
+
+uint computeClusterIndex1d(uint3 clusterIndex3D)
+{
+    return clusterIndex3D.x + (clusterCount.x * (clusterIndex3D.y + clusterCount.y * clusterIndex3D.z));
+}
+
+float4 ClipToView(float4 p)
+{
+    float4 view = mul(inverseProjectionMatrix, p);
+    view = view / view.w;
+    return view;
+}
+
+float4 ScreenToView(float4 p)
+{
+    float2 uv = p.xy * screenSize.zw;
+    float4 clip = float4(uv * 2.0 - 1.0, p.z, p.w);
+#if UNITY_UV_STARTS_AT_TOP
+    clip.y *= -1;
+#endif
+    return ClipToView(clip);
+}
+
+#define BLOCK_SIZE_XY 16
+#define BLock_Size_Z 4
+
+[numthreads(BLOCK_SIZE_XY, BLOCK_SIZE_XY, BLock_Size_Z)]
+void ClusterCompute(CSInput input)
+{
+    if (input.dispatchThreadId.x < clusterCount.x && input.dispatchThreadId.y < clusterCount.y && input.dispatchThreadId.z < clusterCount.z)
+    {
+        float4 posScreen[4];
+        posScreen[0] = float4(input.dispatchThreadId.xy * clusterSize, 1, 1.0);                         // left bottom
+        posScreen[1] = float4((input.dispatchThreadId.xy + uint2(1, 0)) * clusterSize, 1, 1.0);        // right bottom
+        posScreen[2] = float4((input.dispatchThreadId.xy + uint2(0, 1)) * clusterSize, 1, 1.0);        // left top
+        posScreen[3] = float4((input.dispatchThreadId.xy + uint2(1, 1)) * clusterSize, 1, 1.0);        // right top
+                        
+        float3 posView[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            posScreen[i].x = min(posScreen[i].x, screenSize.x);
+            posScreen[i].y = min(posScreen[i].y, screenSize.y);
+            posView[i] = ScreenToView(posScreen[i]).xyz;
+            
+        }
+        
+        float zNearView = lerp(nearFarPlane.x, nearFarPlane.y, (float)input.dispatchThreadId.z / clusterCount.z);
+        float zFarView = lerp(nearFarPlane.x, nearFarPlane.y, (float)(input.dispatchThreadId.z + 1) / clusterCount.z);
+        
+        float3 eyeView = float3(0, 0, 0);
+        Frustum frustum;
+        frustum.planes[0] = ComputePlane(eyeView, posView[0], posView[2]);  // left
+        frustum.planes[1] = ComputePlane(eyeView, posView[3], posView[1]);  // right
+        frustum.planes[2] = ComputePlane(eyeView, posView[2], posView[3]);  // top
+        frustum.planes[3] = ComputePlane(eyeView, posView[1], posView[0]);  // bottom
+        //frustum.planes[4].n = float3(0,0,-1);
+        //frustum.planes[4].d = zNearView;
+        //frustum.planes[5].n = float3(0,0,1);
+        //frustum.planes[5].d = -zFarView;
+        
+        frustum.nearFar = float2(-zNearView, -zFarView);
+                
+        uint clusterIndex = computeClusterIndex1d(input.dispatchThreadId);
+        g_clusters[clusterIndex] = frustum;
+    }
+}

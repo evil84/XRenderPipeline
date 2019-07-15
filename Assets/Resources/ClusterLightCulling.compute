@@ -1,0 +1,232 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ClusterLightCulling
+
+struct Plane
+{
+    float3 n;
+    float d;
+};
+
+struct Frustum
+{
+    Plane planes[4];
+    float2 nearFar;
+};
+
+struct Sphere
+{
+    float3 c;
+    float r;
+};
+
+struct Cone
+{
+    float3 t;   // cone tip
+    float  h;   // cone height
+    float3 d;   // cone dir
+    float  r;   // cone bottom radius
+};
+
+#define LIGHT_TYPE_SPOT             0
+#define LIGHT_TYPE_DIRECTIONAL      1
+#define LIGHT_TYPE_POINT            2
+
+
+struct Light
+{
+    float3 pos;
+    float3 direction;
+    float4 color;
+    float spotAngle;
+    float range;
+    uint type;
+};
+
+struct CSInput
+{
+    uint3 groupId : SV_GroupID;
+    uint3 dispatchThreadId : SV_DispatchThreadID;
+    uint3 groupdThradId : SV_GroupThreadID;
+    uint  groupIndex : SV_GroupIndex;
+};
+
+
+StructuredBuffer<Light> g_lights;
+StructuredBuffer<Frustum> g_clusters;
+
+RWStructuredBuffer<uint> g_pointLightIndexCounter;
+RWStructuredBuffer<uint> g_lightIndexList;
+RWStructuredBuffer<uint2> g_lightGrid;
+float4x4 _CameraViewMatrix;
+uint g_lightCount;
+uint3 clusterCount;
+
+#define NUM_THREADS 1024
+groupshared uint clusterIndex1d;
+groupshared Frustum cluster;
+groupshared uint lightCount;
+groupshared uint lightStartOffset;
+groupshared uint lightList[NUM_THREADS]; 
+groupshared uint totalLightCount;
+
+bool SphereInsidePlane(Sphere sphere, Plane plane)
+{
+    return dot( plane.n, sphere.c ) - plane.d < -sphere.r;
+}
+
+bool SphereInsideFrustum(Sphere sphere, Frustum frustum)
+{
+    bool result = true;
+    
+    float zNear = frustum.nearFar.x;
+    float zFar = frustum.nearFar.y;
+    
+    if ( sphere.c.z - sphere.r > zNear || sphere.c.z + sphere.r < zFar )
+    {
+        result = false;
+    }
+
+    // Then check frustum planes
+    for ( int i = 0; i < 4 && result; i++ )
+    {
+        if (SphereInsidePlane( sphere, frustum.planes[i]))
+        {
+            result = false;
+        }
+    }
+    
+    return result;
+}
+
+bool PointInsidePlane(float3 p, Plane plane)
+{
+    return dot(plane.n, p) - plane.d < 0;
+}
+
+bool ConeInsidePlane(Cone cone, Plane plane)
+{
+    float3 m = normalize( cross( normalize(cross(  plane.n, cone.d  )), cone.d ));
+    float3 q = cone.t + cone.d * cone.h - m * cone.r;
+ 
+    return PointInsidePlane(cone.t, plane) && PointInsidePlane(q, plane);
+}
+
+bool ConeInsideFrustum(Cone cone, Frustum frustum)
+{
+    bool result = true;
+    
+    Plane nearPlane = { float3( 0, 0, -1 ), -frustum.nearFar.x };
+    Plane farPlane = { float3( 0, 0, 1 ), frustum.nearFar.y };
+ 
+    if (ConeInsidePlane(cone, nearPlane) || ConeInsidePlane(cone, farPlane))
+    {
+        result = false;
+    }
+ 
+    for ( int i = 0; i < 4 && result; i++ )
+    {
+        if (ConeInsidePlane(cone, frustum.planes[i]))
+        {
+            result = false;
+        }
+    }
+ 
+    return result;
+}
+
+float DistanceSq(float3 a, float3 b)
+{
+    float x = b.x - a.x;
+    float y = b.y - a.y;
+    float z = b.z - a.z;
+    return x * x + y * y + z * z;
+}
+
+uint3 ComputeClusterIndex3d(uint index)
+{
+    uint x = index % clusterCount.x;
+    uint y = index % (clusterCount.x * clusterCount.y) / clusterCount.x;
+    uint z = index / (clusterCount.x * clusterCount.y);
+    return uint3(x, y, z);
+}
+
+float4 WorldToView(float4 posWorld)
+{
+	float4 posView = mul(_CameraViewMatrix, posWorld);
+	return posView;
+}
+
+
+#define AppendLight(lightIndex, counter, lightList) \
+    InterlockedAdd(counter, 1, index); \
+    if (index < 1024) \
+        lightList[index] = lightIndex;
+        
+
+[numthreads(NUM_THREADS, 1, 1)]
+void ClusterLightCulling (CSInput input)
+{
+    uint index, clusterIndex1d;
+    if (input.groupIndex == 0)
+    {
+        lightCount = 0;
+        uint stride;
+        totalLightCount = g_lightCount;
+        clusterIndex1d = input.groupId.x;
+        cluster = g_clusters[clusterIndex1d];
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    for (int i = input.groupIndex; i < totalLightCount; i += NUM_THREADS)
+    {
+        switch(g_lights[i].type)
+        {
+        case LIGHT_TYPE_DIRECTIONAL:
+            {
+                AppendLight(i, lightCount, lightList);
+            } break;
+        case LIGHT_TYPE_SPOT:
+            {
+                float3 pos = WorldToView(float4(g_lights[i].pos, 1.0)).xyz;
+                float3 dir = normalize(WorldToView(float4(g_lights[i].direction, 0.0))).xyz;
+                pos.z *= -1;
+                dir.z *= -1;
+                float coneRadius = tan(0.5*radians((g_lights[i].spotAngle))) * g_lights[i].range;
+                Cone cone = { pos, g_lights[i].range, dir, coneRadius };
+                if (ConeInsideFrustum(cone, cluster))
+                {
+                    AppendLight(i, lightCount, lightList);
+                }
+            } break;
+        case LIGHT_TYPE_POINT:
+            {
+                float3 lightPos = g_lights[i].pos;
+                float lightRange = g_lights[i].range;
+                Sphere s;
+                s.c =  WorldToView(float4(lightPos, 1.0)).xyz;
+                s.c.z *= -1.0;
+                s.r = lightRange;
+                if (SphereInsideFrustum(s, cluster))
+                {
+                    AppendLight(i, lightCount, lightList);
+                }
+            } break;
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    if (input.groupIndex == 0)
+    {
+        InterlockedAdd(g_pointLightIndexCounter[0], lightCount, lightStartOffset);
+        g_lightGrid[clusterIndex1d] = uint2(lightStartOffset, lightCount);
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    for (int i = input.groupIndex; i < lightCount; i+= NUM_THREADS)
+    {
+        g_lightIndexList[lightStartOffset + i] = lightList[i];
+    }
+}
