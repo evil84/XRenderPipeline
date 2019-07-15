@@ -1,0 +1,75 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel DebugLightting
+
+Texture2D sceneTexture;
+Texture2D depthTexture;
+Texture2D lightHeatTexture;
+StructuredBuffer<uint2> lightGridBuffer;
+RWTexture2D<float4> debugTexture;
+
+SamplerState sampler_linear_repeat;
+
+float4 screenSize;
+uint3 clusterCount;
+float4x4 inverseProjectionMatrix;
+uint3 clusterSize;
+
+#define BLOCK_SIZE 32
+
+float4 ClipToView(float4 p)
+{
+    float4 view = mul(inverseProjectionMatrix, p);
+    view = view / view.w;
+    return view;
+}
+
+float4 ScreenToView(float4 p)
+{
+    float2 uv = p.xy * screenSize.zw;
+    float4 clip = float4(uv * 2.0 - 1.0, p.z, p.w);
+#if UNITY_UV_STARTS_AT_TOP
+    clip.y *= -1;
+#endif
+    return ClipToView(clip);
+}
+
+uint computeClusterIndex(uint3 clusterIndex3D)
+{
+    return clusterIndex3D.x + (clusterCount.x * (clusterIndex3D.y + clusterCount.y * clusterIndex3D.z));
+}
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+void DebugLightting (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < screenSize.x && id.y < screenSize.y)
+    {    
+        uint2 screenCoord = id.xy;
+        float depth = depthTexture.Load(uint3(screenCoord, 0)).x;
+        float4 color = sceneTexture.Load(uint3(screenCoord, 0));
+        uint lightCount = 0;
+        debugTexture[screenCoord] = color * 0.8;
+        if (depth > 0)
+        {
+            float4 posView = ScreenToView(float4(screenCoord, depth, 1.0));
+            
+        
+            float3 screenPos = float3(id.xy, posView.z);
+        
+            screenPos /= clusterSize;
+        
+            uint index = computeClusterIndex(screenPos);
+            lightCount += lightGridBuffer[index].y;
+        }
+        
+        if (lightCount > 0)
+        {
+            float normalizedLightCount = lightCount / 500.0;
+            float4 lightCountColor = lightHeatTexture.SampleLevel(sampler_linear_repeat, float2(normalizedLightCount, 0), 0);//   tex2D(LightCountHeatMapTex, float2(normalizedLightCount, 0));
+            float3 color = lightCountColor.rgb;
+            //float3 color = float3(normalizedLightCount, 0, 0);
+            //float4 color = tex2D(LightCountHeatMapTex, float2(normalizedLightCount, 0));
+            debugTexture[screenCoord] += float4(color.rgb * 1, 0.9);
+        }
+        //debugTexture[screenCoord] = color ;
+    }
+}

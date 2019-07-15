@@ -63,6 +63,8 @@ public class MyRenderPipeline : RenderPipeline
 	private int depthTargetTextureId;
 	private int colorTargetTextureId;
 
+	private Texture2D _LightHeatTexture;
+
 	private RenderTexture _debugTexture;
 	
 	public MyRenderPipeline(XPipelineAsset asset)
@@ -77,6 +79,7 @@ public class MyRenderPipeline : RenderPipeline
 		_debugLightingKernel = _debugLightingCS.FindKernel("DebugLightting");
 		depthTargetTextureId = Shader.PropertyToID("depthTexture");
 		colorTargetTextureId = Shader.PropertyToID("sceneTexture");
+		_LightHeatTexture = Resources.Load<Texture2D>("lightHeat");
 	}
 	
     protected override void Render(ScriptableRenderContext context, Camera[] cameras)
@@ -130,6 +133,7 @@ public class MyRenderPipeline : RenderPipeline
 		LightCulling(camera);
 		context.ExecuteCommandBuffer(_cameraBuffer);
 		_cameraBuffer.Clear();
+
 		//DrawDepthOnlyPass(camera, context, cullingResult);
 		
 		_ClusterXCount = Mathf.CeilToInt((float) Screen.width / clusterWidth);
@@ -168,12 +172,12 @@ public class MyRenderPipeline : RenderPipeline
 		    context.DrawGizmos(camera, GizmoSubset.PostImageEffects);
 	    }
 	    
-	    //DebugLighting(camera);
+	    DebugLighting(camera);
 	    context.ExecuteCommandBuffer(_cameraBuffer);
 	    _cameraBuffer.Clear();
 	    
-	    //_cameraBuffer.Blit(_debugTexture, BuiltinRenderTextureType.CameraTarget);
-	    _cameraBuffer.Blit(new RenderTargetIdentifier(colorTargetTextureId), BuiltinRenderTextureType.CameraTarget);
+	    _cameraBuffer.Blit(_debugTexture, BuiltinRenderTextureType.CameraTarget);
+	    //_cameraBuffer.Blit(new RenderTargetIdentifier(colorTargetTextureId), BuiltinRenderTextureType.CameraTarget);
 	    context.ExecuteCommandBuffer(_cameraBuffer);
 	    _cameraBuffer.Clear();
 	    context.Submit();
@@ -198,7 +202,7 @@ public class MyRenderPipeline : RenderPipeline
 		if (camera.cameraType == CameraType.SceneView)
 			projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
 		else
-			projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, false);
+			projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
 		
 		var projectionMatrixInverse = projectionMatrix.inverse;
 		
@@ -302,14 +306,16 @@ public class MyRenderPipeline : RenderPipeline
 	    _cameraBuffer.SetComputeTextureParam(_debugLightingCS, _debugLightingKernel, "sceneTexture", new RenderTargetIdentifier(colorTargetTextureId));
 	    _cameraBuffer.SetComputeBufferParam(_debugLightingCS, _debugLightingKernel, "lightGridBuffer", g_lightGrid);
 	    _cameraBuffer.SetComputeFloatParams(_debugLightingCS, "screenSize", new float[] { Screen.width, Screen.height, 1.0f / Screen.width, 1.0f / Screen.height });
-	    _cameraBuffer.SetComputeIntParams(_clusterRenderingCS, "clusterCount", new int[]{ clusterXCount, clusterYCount, clusterZCount });
+	    _cameraBuffer.SetComputeIntParams(_debugLightingCS, "clusterCount", new int[]{ clusterXCount, clusterYCount, clusterZCount });
+	    _cameraBuffer.SetGlobalVector("clusterSize", new Vector3(clusterWidth, clusterHeight, Mathf.CeilToInt((camera.farClipPlane - camera.nearClipPlane) / clusterZCount)));
 	    Matrix4x4 projectionMatrix;
 	    if (camera.cameraType == CameraType.SceneView)
 		    projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
 	    else
-		    projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, false);
+		    projectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
 		
 	    var projectionMatrixInverse = projectionMatrix.inverse;
+	    _cameraBuffer.SetGlobalTexture("lightHeatTexture", _LightHeatTexture);
 	    _cameraBuffer.SetComputeMatrixParam(_debugLightingCS, "inverseProjectionMatrix", projectionMatrixInverse);
 	    _cameraBuffer.DispatchCompute(_debugLightingCS, _debugLightingKernel, Mathf.CeilToInt((float)Screen.width / 32), Mathf.CeilToInt((float)Screen.height / 32), 1);
     }
